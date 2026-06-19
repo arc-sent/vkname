@@ -3,6 +3,10 @@
 
 # Данные бота (база и состояние)
 data/
+bot.db
+bot.db-wal
+bot.db-shm
+bot_state.pickle
 
 # Python
 __pycache__/

@@ -1,4 +1,5 @@
 import os
+import shutil
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -19,7 +20,7 @@ from downloader import detect_platform, download_tiktok, download_likee, downloa
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-VK_API_VERSION = "5.131"
+VK_API_VERSION = "5.199"
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
 PLATFORM_LABELS = {
@@ -47,7 +48,9 @@ T_TITLE, T_BODY = range(30, 32)
 
 TIME_SLOTS = [9, 15, 20]
 
-# Активные задачи загрузки по chat_id (Task не сериализуется, поэтому не в user_data)
+# Активные задачи загрузки по message_id статусного сообщения
+# (Task не сериализуется, поэтому не в user_data; ключ по message_id —
+#  чтобы поддержать несколько параллельных загрузок и точечную отмену каждой).
 _upload_tasks: dict[int, asyncio.Task] = {}
 
 CANCEL_MARKUP = InlineKeyboardMarkup([[
@@ -111,17 +114,27 @@ def fetch_vk_group_name(vk_token: str, group_id: int) -> str | None:
     return None
 
 
+# Папка для хранения скачанных файлов до момента публикации.
+# Файлы лежат здесь от момента скачивания до запланированного времени —
+# могут пережить перезапуск бота (volume в Docker смонтирован).
+PENDING_DIR = os.path.join(db.DATA_DIR, "pending_videos")
+
+
 def upload_to_vk(
     vk_token: str,
     vk_group_id: int,
     file_path: str,
     title: str,
     description: str,
-    publish_date: int | None = None,
 ) -> None:
-    group_id = abs(int(vk_group_id))
+    """Загружает видео в VK и сразу публикует запись на стене группы.
 
-    logger.info("upload_to_vk: description=%r", description)
+    Всегда публикует НЕМЕДЛЕННО — планирование времени делается на стороне
+    бота (job_queue), а не через publish_date в VK API. Это гарантирует, что
+    видео не появится в разделе «Видео» группы раньше времени.
+    """
+    group_id = abs(int(vk_group_id))
+    logger.info("upload_to_vk: group_id=%s description=%r", group_id, description)
 
     save_data = {
         "access_token": vk_token,
@@ -138,7 +151,6 @@ def upload_to_vk(
         data=save_data,
         timeout=30,
     ).json()
-
     logger.info("video.save response: %s", save_resp)
 
     if "error" in save_resp:
@@ -162,24 +174,77 @@ def upload_to_vk(
         "attachments": f"video{owner_id}_{video_id}",
         "from_group": 1,
     }
-    if publish_date:
-        wall_params["publish_date"] = publish_date
-
-    logger.info(
-        "wall.post params: owner_id=%s attachments=%s publish_date=%s",
-        wall_params["owner_id"],
-        wall_params["attachments"],
-        publish_date,
-    )
-    wall_resp = requests.post("https://api.vk.com/method/wall.post", data=wall_params, timeout=30).json()
+    wall_resp = requests.post(
+        "https://api.vk.com/method/wall.post", data=wall_params, timeout=30
+    ).json()
     logger.info("wall.post response: %s", wall_resp)
 
     if "error" in wall_resp:
         e = wall_resp["error"]
+        try:
+            requests.post(
+                "https://api.vk.com/method/video.delete",
+                data={
+                    "access_token": vk_token,
+                    "v": VK_API_VERSION,
+                    "owner_id": owner_id,
+                    "video_id": video_id,
+                },
+                timeout=30,
+            )
+        except Exception:
+            logger.exception("Не удалось откатить видео")
         raise RuntimeError(
-            f"VK wall.post ошибка {e.get('error_code')}: {e.get('error_msg')}\n"
-            f"Полный ответ: {wall_resp}"
+            f"VK wall.post ошибка {e.get('error_code')}: {e.get('error_msg')}"
         )
+
+
+async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB job: вызывается в момент запланированной публикации.
+
+    Загружает видео в VK и сразу публикует — никаких publish_date не передаём,
+    поэтому видео появляется в группе ровно в этот момент и ровно один раз.
+    """
+    data = context.job.data
+    chat_id = data["chat_id"]
+    file_path = data["file_path"]
+
+    try:
+        if not os.path.exists(file_path):
+            await context.bot.send_message(
+                chat_id,
+                "❌ Не удалось опубликовать: файл видео не найден.\n"
+                "Возможно, бот перезапускался и временный файл был удалён. Загрузи видео заново."
+            )
+            return
+
+        await context.bot.send_message(chat_id, "⏰ Публикую видео по расписанию...")
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: upload_to_vk(
+                data["vk_token"],
+                data["vk_group_id"],
+                file_path,
+                data["title"],
+                data["description"],
+            ),
+        )
+
+        await context.bot.send_message(chat_id, "✅ Видео опубликовано в VK!")
+    except Exception as exc:
+        logger.exception("Ошибка отложенной публикации chat_id=%s", chat_id)
+        try:
+            await context.bot.send_message(chat_id, f"❌ Ошибка публикации: {exc}")
+        except Exception:
+            pass
+    finally:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
 
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
@@ -274,14 +339,18 @@ def build_templates_manage_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
 async def do_upload(
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
+    job: dict,
     publish_date: int | None = None,
     status_message=None,
+    task_key: int | None = None,
 ):
-    url = context.user_data["url"]
-    platform = context.user_data["platform"]
-    description = context.user_data.get("description", "")
-    vk_token = context.user_data["vk_token"]
-    vk_group_id = context.user_data["vk_group_id"]
+    # job — снимок данных на момент старта. context.user_data НЕ используем:
+    # пользователь может начать новый поток, и общий user_data будет перезаписан.
+    url = job["url"]
+    platform = job["platform"]
+    description = job.get("description", "")
+    vk_token = job["vk_token"]
+    vk_group_id = job["vk_group_id"]
     file_path: str | None = None
 
     async def set_status(text: str, final: bool = False):
@@ -303,22 +372,46 @@ async def do_upload(
         else:
             raise ValueError(f"Неизвестная платформа: {platform}")
 
-        size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        logger.info("do_upload: description=%r", description)
-        await set_status(f"📤 Загружаю в VK...\nРазмер: {size_mb:.1f} МБ")
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: upload_to_vk(vk_token, vk_group_id, file_path, title, description, publish_date),
-        )
+        logger.info("do_upload: description=%r publish_date=%s", description, publish_date)
 
         if publish_date:
+            # Скачали — теперь перекладываем в постоянное хранилище и
+            # ставим задачу на нужное время. В VK ничего не грузим до этого
+            # момента — иначе видео сразу появится в разделе «Видео» группы.
+            os.makedirs(PENDING_DIR, exist_ok=True)
+            persistent_path = os.path.join(PENDING_DIR, os.path.basename(file_path))
+            shutil.move(file_path, persistent_path)
+            file_path = None  # файл перемещён, finally не должен его удалять
+
             dt = datetime.fromtimestamp(publish_date, tz=MOSCOW_TZ)
+            context.job_queue.run_once(
+                _scheduled_upload_job,
+                when=dt,
+                data={
+                    "chat_id": chat_id,
+                    "file_path": persistent_path,
+                    "title": title,
+                    "description": description,
+                    "vk_token": vk_token,
+                    "vk_group_id": vk_group_id,
+                },
+                name=f"scheduled_{task_key}",
+            )
+
             await set_status(
-                f"✅ Готово!\n\n📅 {dt.strftime('%d.%m.%Y в %H:%M')} МСК",
+                f"✅ Видео скачано!\n\n"
+                f"📅 Опубликую {dt.strftime('%d.%m.%Y в %H:%M')} МСК.\n"
+                f"До этого момента видео нигде в VK не появится.",
                 final=True,
             )
         else:
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            await set_status(f"📤 Загружаю в VK...\nРазмер: {size_mb:.1f} МБ")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: upload_to_vk(vk_token, vk_group_id, file_path, title, description),
+            )
             await set_status("✅ Опубликовано в VK!", final=True)
 
     except asyncio.CancelledError:
@@ -334,7 +427,8 @@ async def do_upload(
         logger.exception("Ошибка обработки %s", url)
         await set_status(f"❌ Ошибка\n\n{exc}", final=True)
     finally:
-        _upload_tasks.pop(chat_id, None)
+        if task_key is not None:
+            _upload_tasks.pop(task_key, None)
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -342,13 +436,32 @@ async def do_upload(
                 pass
 
 
-async def _run_upload(chat_id: int, context: ContextTypes.DEFAULT_TYPE, publish_date: int | None, status_msg):
-    task = asyncio.create_task(do_upload(chat_id, context, publish_date=publish_date, status_message=status_msg))
-    _upload_tasks[chat_id] = task
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+def _snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Фиксирует данные текущего потока, чтобы фоновая загрузка не зависела от
+    последующих изменений context.user_data (новый поток / параллельная загрузка)."""
+    return {
+        "url": context.user_data["url"],
+        "platform": context.user_data["platform"],
+        "description": context.user_data.get("description", ""),
+        "vk_token": context.user_data["vk_token"],
+        "vk_group_id": context.user_data["vk_group_id"],
+    }
+
+
+def _start_upload(chat_id: int, context: ContextTypes.DEFAULT_TYPE, publish_date: int | None, status_msg) -> None:
+    """Запускает загрузку в фоне и СРАЗУ возвращается — диспетчер бота не блокируется,
+    поэтому бот продолжает отвечать на другие сообщения во время скачивания/заливки."""
+    job = _snapshot_job(context)
+    task_key = status_msg.message_id
+    task = asyncio.create_task(
+        do_upload(
+            chat_id, context, job,
+            publish_date=publish_date,
+            status_message=status_msg,
+            task_key=task_key,
+        )
+    )
+    _upload_tasks[task_key] = task
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -455,7 +568,7 @@ async def handle_time_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if data == "now":
         status_msg = await query.edit_message_text("⏳ Начинаю...", reply_markup=CANCEL_MARKUP)
-        await _run_upload(chat_id, context, publish_date=None, status_msg=status_msg)
+        _start_upload(chat_id, context, publish_date=None, status_msg=status_msg)
         return ConversationHandler.END
 
     if data == "custom":
@@ -470,7 +583,7 @@ async def handle_time_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     h = int(hour_str)
     scheduled_time = MOSCOW_TZ.localize(datetime(d.year, d.month, d.day, h))
     status_msg = await query.edit_message_text("⏳ Начинаю...", reply_markup=CANCEL_MARKUP)
-    await _run_upload(chat_id, context, publish_date=int(scheduled_time.timestamp()), status_msg=status_msg)
+    _start_upload(chat_id, context, publish_date=int(scheduled_time.timestamp()), status_msg=status_msg)
     return ConversationHandler.END
 
 
@@ -489,14 +602,15 @@ async def handle_custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return UP_CUSTOM_TIME
 
     status_msg = await update.message.reply_text("⏳ Начинаю...", reply_markup=CANCEL_MARKUP)
-    await _run_upload(update.message.chat_id, context, publish_date=int(scheduled_time.timestamp()), status_msg=status_msg)
+    _start_upload(update.message.chat_id, context, publish_date=int(scheduled_time.timestamp()), status_msg=status_msg)
     return ConversationHandler.END
 
 
 async def handle_cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer("Отмена...")
-    task = _upload_tasks.get(query.message.chat_id)
+    # Кнопка «Отмена» висит на том же сообщении, по которому задача и ключуется.
+    task = _upload_tasks.get(query.message.message_id)
     if task and not task.done():
         task.cancel()
     else:
@@ -806,7 +920,23 @@ def main() -> None:
     persistence = PicklePersistence(
         filepath=os.path.join(db.DATA_DIR, "bot_state.pickle")
     )
-    app = Application.builder().token(TELEGRAM_TOKEN).persistence(persistence).build()
+    # concurrent_updates=True — апдейты обрабатываются параллельно, поэтому медленная
+    # операция в одном потоке не «замораживает» ответы остальным сообщениям.
+    # Увеличенные таймауты и пул соединений — чтобы случайные обрывы/медленная
+    # сеть до api.telegram.org не валили обработку с TimedOut.
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .persistence(persistence)
+        .concurrent_updates(True)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .get_updates_connect_timeout(30.0)
+        .get_updates_read_timeout(30.0)
+        .build()
+    )
 
     upload_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)],
@@ -822,6 +952,7 @@ def main() -> None:
         conversation_timeout=300,
         name="upload_conv",
         persistent=False,
+        allow_reentry=True,
     )
 
     token_conv = ConversationHandler(
@@ -835,6 +966,7 @@ def main() -> None:
         conversation_timeout=300,
         name="token_conv",
         persistent=False,
+        allow_reentry=True,
     )
 
     groups_conv = ConversationHandler(
@@ -853,6 +985,7 @@ def main() -> None:
         conversation_timeout=300,
         name="groups_conv",
         persistent=False,
+        allow_reentry=True,
     )
 
     templates_conv = ConversationHandler(
@@ -869,6 +1002,7 @@ def main() -> None:
         conversation_timeout=300,
         name="templates_conv",
         persistent=False,
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", cmd_start))

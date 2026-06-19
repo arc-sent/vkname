@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import ssl
+import subprocess
 import tempfile
 import uuid
 
@@ -95,6 +96,9 @@ def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
     ydl_opts = {
         "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        # Приоритет H.264: VK кладёт в «Клипы» только H.264, а TikTok отдаёт
+        # высокое разрешение в HEVC. Берём лучший доступный H.264-вариант.
+        "format_sort": ["vcodec:h264"],
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
@@ -106,7 +110,7 @@ def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
     files = [f for f in os.listdir(tmpdir) if os.path.isfile(os.path.join(tmpdir, f))]
     if not files:
         raise RuntimeError("Файл TikTok не был скачан")
-    return os.path.join(tmpdir, files[0]), title
+    return _ensure_h264(os.path.join(tmpdir, files[0])), title
 
 
 async def download_tiktok(url: str, save_path: str | None = None) -> tuple[str, str]:
@@ -169,7 +173,7 @@ def _download_likee_sync(url: str) -> tuple[str, str]:
             for chunk in r.iter_content(chunk_size=65536):
                 f.write(chunk)
 
-    return out_path, info["title"]
+    return _ensure_h264(out_path), info["title"]
 
 
 async def download_likee(url: str) -> tuple[str, str]:
@@ -213,6 +217,56 @@ def _check_duration(duration: int | None) -> None:
     if duration and duration > MAX_VIDEO_DURATION:
         mins, secs = divmod(duration, 60)
         raise ValueError(f"Видео слишком длинное — {mins}:{secs:02d}. Максимум 3 минуты.")
+
+
+def _ensure_h264(path: str) -> str:
+    """Гарантирует, что видеопоток ролика — H.264.
+
+    VK помещает запись в раздел «Клипы», только если видео в кодеке H.264.
+    Ролики в HEVC (H.265) — например, высокое разрешение с TikTok — VK кладёт
+    в обычные «Видео». Мы всегда стараемся скачать сразу H.264 (см. format_sort),
+    но если у источника есть только HEVC/иной кодек — перекодируем, сохраняя
+    разрешение. Возвращает путь к H.264-файлу (тот же или новый).
+    """
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        codec = probe.stdout.strip().lower()
+    except Exception:
+        logger.exception("ffprobe не сработал — оставляю файл как есть")
+        return path
+
+    if codec in ("h264", "avc1", ""):
+        return path  # уже H.264 (либо не смогли определить — не трогаем)
+
+    logger.info("видеокодек %s — перекодирую в H.264 для совместимости с клипами VK", codec)
+    out_path = path + ".h264.mp4"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", path,
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "128k",
+             "-movflags", "+faststart", out_path],
+            capture_output=True, timeout=600, check=True,
+        )
+    except Exception:
+        logger.exception("перекодирование в H.264 не удалось — публикую исходный файл")
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+        return path
+
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return out_path
 
 
 def _extract_vk_ids(url: str) -> tuple[str, str] | None:
@@ -283,7 +337,7 @@ def _try_vk_api(oid: str, vid: str, token: str) -> tuple[str, int, int | None] |
     try:
         data = _make_session().get(
             "https://api.vk.com/method/video.get",
-            params={"videos": f"{oid}_{vid}", "access_token": token, "v": "5.131"},
+            params={"videos": f"{oid}_{vid}", "access_token": token, "v": "5.199"},
             timeout=15,
         ).json()
         items = data.get("response", {}).get("items", [])
@@ -355,22 +409,79 @@ def _get_vk_info_sync(url: str, vk_token: str | None) -> dict:
     )
 
 
+def _video_download_headers(video_url: str) -> dict:
+    """Выбирает заголовки в зависимости от CDN.
+
+    okcdn.ru — CDN Одноклассников; отвергает Referer vk.com с 400 Bad Request.
+    Для него используем Referer ok.ru. Для остальных CDN — стандартный vk.com.
+    """
+    if "okcdn.ru" in video_url or "ok.ru" in video_url:
+        return {"User-Agent": _DESKTOP_UA, "Referer": "https://ok.ru/"}
+    return {"User-Agent": _DESKTOP_UA, "Referer": "https://vk.com/"}
+
+
+def _download_vk_ytdlp_sync(url: str) -> tuple[str, str]:
+    """Скачивает VK видео/клип через yt-dlp.
+
+    Запасной метод: работает с клипами (HLS), нестандартными видео и любыми
+    форматами, которые не поддерживают прямые методы (embed/ajax/api/mobile).
+    """
+    # Фаза 1: метаданные без скачивания — проверяем длительность
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+        meta = ydl.extract_info(url, download=False)
+    _check_duration(meta.get("duration"))
+
+    # Фаза 2: скачиваем
+    tmpdir = _tmp_path("vk_dir")
+    os.makedirs(tmpdir, exist_ok=True)
+    ydl_opts = {
+        "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        # Приоритет H.264 — чтобы ролик попал в «Клипы», а не в «Видео» VK.
+        "format_sort": ["vcodec:h264"],
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    title = (info.get("title") or "VK видео")[:100]
+    files = [f for f in os.listdir(tmpdir) if os.path.isfile(os.path.join(tmpdir, f))]
+    if not files:
+        raise RuntimeError("Файл VK (yt-dlp) не был скачан")
+    return _ensure_h264(os.path.join(tmpdir, files[0])), title
+
+
 def _download_vk_sync(url: str, vk_token: str | None) -> tuple[str, str]:
-    info = _get_vk_info_sync(url, vk_token)
-    _check_duration(info.get("duration"))
-    out_path = _tmp_path("vk") + ".mp4"
+    # Пробуем быстрый путь: embed / ajax / VK API / mobile.
+    # Для клипов и HLS-видео он почти всегда заканчивается ValueError —
+    # тогда падаем на yt-dlp, который умеет и клипы, и HLS.
+    info = None
+    try:
+        info = _get_vk_info_sync(url, vk_token)
+    except ValueError:
+        logger.info("VK: прямые методы не дали ссылку, пробую yt-dlp")
 
-    with _make_session().get(
-        info["video_url"],
-        headers={"User-Agent": _DESKTOP_UA, "Referer": "https://vk.com/"},
-        stream=True, timeout=180,
-    ) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                f.write(chunk)
+    if info is not None:
+        _check_duration(info.get("duration"))
+        out_path = _tmp_path("vk") + ".mp4"
+        headers = _video_download_headers(info["video_url"])
+        try:
+            with _make_session().get(
+                info["video_url"],
+                headers=headers,
+                stream=True, timeout=180,
+            ) as r:
+                r.raise_for_status()
+                with open(out_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+            return _ensure_h264(out_path), info["title"]
+        except Exception as e:
+            logger.info("VK: скачивание прямой ссылкой упало (%s), пробую yt-dlp", e)
 
-    return out_path, info["title"]
+    return _download_vk_ytdlp_sync(url)
 
 
 async def download_vk(url: str, vk_token: str | None = None) -> tuple[str, str]:
