@@ -1,5 +1,6 @@
 import os
 import shutil
+import random
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -48,10 +49,35 @@ T_TITLE, T_BODY = range(30, 32)
 
 TIME_SLOTS = [9, 15, 20]
 
+# ─── Контроль нагрузки на VK (настраивается через .env) ───────────────────────
+# Сколько публикаций может уходить в VK одновременно. Несколько роликов,
+# запланированных на один слот, стартуют почти одновременно — семафор
+# выстраивает их в очередь, чтобы не словить VK rate limit (error_code 6/9).
+VK_PUBLISH_CONCURRENCY = int(os.getenv("VK_PUBLISH_CONCURRENCY", "1"))
+_vk_publish_semaphore = asyncio.Semaphore(VK_PUBLISH_CONCURRENCY)
+
+# Ретрай публикации при временных ошибках VK / сети.
+VK_PUBLISH_RETRIES = int(os.getenv("VK_PUBLISH_RETRIES", "3"))       # всего попыток
+VK_RETRY_BASE_DELAY = float(os.getenv("VK_RETRY_BASE_DELAY", "3"))   # секунды, растёт экспоненциально
+# Коды ошибок VK, при которых имеет смысл повторить запрос.
+VK_RETRYABLE_ERROR_CODES = {1, 6, 9, 10}  # неизвестная/too many/flood/internal
+
+# Джиттер времени публикации: чтобы ролики не выходили ровно в HH:00:00
+# (для реков — «живее», когда время чуть «плавает»).
+PUBLISH_JITTER_SECONDS = int(os.getenv("PUBLISH_JITTER_SECONDS", "300"))
+
 # Активные задачи загрузки по message_id статусного сообщения
 # (Task не сериализуется, поэтому не в user_data; ключ по message_id —
 #  чтобы поддержать несколько параллельных загрузок и точечную отмену каждой).
 _upload_tasks: dict[int, asyncio.Task] = {}
+
+
+class VKError(RuntimeError):
+    """Ошибка VK API с кодом — чтобы отличать временные сбои от фатальных."""
+
+    def __init__(self, code: int | None, message: str):
+        self.code = code
+        super().__init__(message)
 
 CANCEL_MARKUP = InlineKeyboardMarkup([[
     InlineKeyboardButton("❌ Отменить", callback_data="cancel_upload")
@@ -155,7 +181,7 @@ def upload_to_vk(
 
     if "error" in save_resp:
         e = save_resp["error"]
-        raise RuntimeError(f"VK video.save ошибка {e.get('error_code')}: {e.get('error_msg')}")
+        raise VKError(e.get("error_code"), f"VK video.save ошибка {e.get('error_code')}: {e.get('error_msg')}")
 
     video_id = save_resp["response"]["video_id"]
     owner_id = save_resp["response"]["owner_id"]
@@ -194,9 +220,51 @@ def upload_to_vk(
             )
         except Exception:
             logger.exception("Не удалось откатить видео")
-        raise RuntimeError(
-            f"VK wall.post ошибка {e.get('error_code')}: {e.get('error_msg')}"
+        raise VKError(
+            e.get("error_code"),
+            f"VK wall.post ошибка {e.get('error_code')}: {e.get('error_msg')}",
         )
+
+
+async def _publish_to_vk(
+    vk_token: str,
+    vk_group_id: int,
+    file_path: str,
+    title: str,
+    description: str,
+) -> None:
+    """Публикует видео в VK с ограничением одновременности и ретраями.
+
+    - семафор (1): запросы к VK не идут лавиной, даже если в один слот попало
+      много роликов — они выстраиваются в очередь;
+    - ретрай с экспоненциальным backoff на временные ошибки VK (rate limit /
+      flood / internal) и сетевые сбои.
+    """
+    loop = asyncio.get_running_loop()
+    async with _vk_publish_semaphore:
+        last_exc: Exception | None = None
+        for attempt in range(1, VK_PUBLISH_RETRIES + 1):
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda: upload_to_vk(vk_token, vk_group_id, file_path, title, description),
+                )
+                return
+            except VKError as exc:
+                last_exc = exc
+                if exc.code not in VK_RETRYABLE_ERROR_CODES or attempt == VK_PUBLISH_RETRIES:
+                    raise
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                if attempt == VK_PUBLISH_RETRIES:
+                    raise
+
+            delay = VK_RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 2)
+            logger.warning(
+                "Публикация в VK не удалась (попытка %s/%s): %s. Повтор через %.1f c",
+                attempt, VK_PUBLISH_RETRIES, last_exc, delay,
+            )
+            await asyncio.sleep(delay)
 
 
 async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -208,6 +276,7 @@ async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data
     chat_id = data["chat_id"]
     file_path = data["file_path"]
+    group_name = data.get("vk_group_name") or "VK"
 
     try:
         if not os.path.exists(file_path):
@@ -220,19 +289,15 @@ async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         await context.bot.send_message(chat_id, "⏰ Публикую видео по расписанию...")
 
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: upload_to_vk(
-                data["vk_token"],
-                data["vk_group_id"],
-                file_path,
-                data["title"],
-                data["description"],
-            ),
+        await _publish_to_vk(
+            data["vk_token"],
+            data["vk_group_id"],
+            file_path,
+            data["title"],
+            data["description"],
         )
 
-        await context.bot.send_message(chat_id, "✅ Видео опубликовано в VK!")
+        await context.bot.send_message(chat_id, f"✅ Видео опубликовано в {group_name}!")
     except Exception as exc:
         logger.exception("Ошибка отложенной публикации chat_id=%s", chat_id)
         try:
@@ -351,6 +416,7 @@ async def do_upload(
     description = job.get("description", "")
     vk_token = job["vk_token"]
     vk_group_id = job["vk_group_id"]
+    vk_group_name = job.get("vk_group_name") or "VK"
     file_path: str | None = None
 
     async def set_status(text: str, final: bool = False):
@@ -383,7 +449,11 @@ async def do_upload(
             shutil.move(file_path, persistent_path)
             file_path = None  # файл перемещён, finally не должен его удалять
 
-            dt = datetime.fromtimestamp(publish_date, tz=MOSCOW_TZ)
+            # Джиттер: сдвигаем фактическую публикацию на случайные секунды
+            # вперёд, чтобы ролики не выходили ровно в HH:00:00 — для реков
+            # «живее», и заодно разносит во времени видео из одного слота.
+            jitter = random.randint(0, PUBLISH_JITTER_SECONDS)
+            dt = datetime.fromtimestamp(publish_date + jitter, tz=MOSCOW_TZ)
             context.job_queue.run_once(
                 _scheduled_upload_job,
                 when=dt,
@@ -394,25 +464,22 @@ async def do_upload(
                     "description": description,
                     "vk_token": vk_token,
                     "vk_group_id": vk_group_id,
+                    "vk_group_name": vk_group_name,
                 },
                 name=f"scheduled_{task_key}",
             )
 
             await set_status(
                 f"✅ Видео скачано!\n\n"
-                f"📅 Опубликую {dt.strftime('%d.%m.%Y в %H:%M')} МСК.\n"
-                f"До этого момента видео нигде в VK не появится.",
+                f"📅 Опубликую примерно {dt.strftime('%d.%m.%Y в %H:%M')} МСК "
+                f"в «{vk_group_name}».",
                 final=True,
             )
         else:
             size_mb = os.path.getsize(file_path) / (1024 * 1024)
             await set_status(f"📤 Загружаю в VK...\nРазмер: {size_mb:.1f} МБ")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: upload_to_vk(vk_token, vk_group_id, file_path, title, description),
-            )
-            await set_status("✅ Опубликовано в VK!", final=True)
+            await _publish_to_vk(vk_token, vk_group_id, file_path, title, description)
+            await set_status(f"✅ Опубликовано в {vk_group_name}!", final=True)
 
     except asyncio.CancelledError:
         try:
@@ -445,6 +512,7 @@ def _snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> dict:
         "description": context.user_data.get("description", ""),
         "vk_token": context.user_data["vk_token"],
         "vk_group_id": context.user_data["vk_group_id"],
+        "vk_group_name": context.user_data.get("vk_group_name", ""),
     }
 
 
@@ -526,6 +594,7 @@ async def handle_group_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     context.user_data["vk_group_id"] = group["vk_group_id"]
+    context.user_data["vk_group_name"] = group["name"]
     telegram_id = update.effective_user.id
     await query.edit_message_text(
         f"Группа: {group['name']}\n\nВыбери описание:",
