@@ -4,5 +4,8 @@ services:
     restart: unless-stopped
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - ERROR_RETENTION_DAYS=${ERROR_RETENTION_DAYS:-5}
+      - ERROR_CLEANUP_INTERVAL_DAYS=${ERROR_CLEANUP_INTERVAL_DAYS:-5}
     volumes:
       - ./data:/app/data
