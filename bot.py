@@ -5,6 +5,7 @@ import random
 import asyncio
 import logging
 import traceback as tb_module
+import uuid
 from io import BytesIO
 from datetime import datetime, timedelta
 
@@ -65,11 +66,25 @@ T_TITLE, T_BODY = range(30, 32)
 TIME_SLOTS = [9, 15, 20]
 
 # ─── Контроль нагрузки на VK (настраивается через .env) ───────────────────────
-# Сколько публикаций может уходить в VK одновременно. Несколько роликов,
-# запланированных на один слот, стартуют почти одновременно — семафор
-# выстраивает их в очередь, чтобы не словить VK rate limit (error_code 6/9).
+# Сколько публикаций ОДНОГО пользователя может уходить в VK одновременно.
+# Лимиты VK (error_code 6/9) считаются по access_token, т.е. на пользователя —
+# поэтому семафор отдельный на каждого юзера (см. _user_publish_semaphore).
+# Так разные пользователи никогда не блокируют друг друга, а несколько роликов
+# одного юзера в один слот по-прежнему выстраиваются в очередь.
 VK_PUBLISH_CONCURRENCY = int(os.getenv("VK_PUBLISH_CONCURRENCY", "1"))
-_vk_publish_semaphore = asyncio.Semaphore(VK_PUBLISH_CONCURRENCY)
+_vk_publish_semaphores: dict[int, asyncio.Semaphore] = {}
+
+
+def _user_publish_semaphore(telegram_id: int) -> asyncio.Semaphore:
+    """Семафор публикации для конкретного пользователя (создаётся лениво).
+
+    В asyncio один поток выполнения, между get и присваиванием нет await —
+    поэтому get-or-create атомарен, гонки нет."""
+    sem = _vk_publish_semaphores.get(telegram_id)
+    if sem is None:
+        sem = asyncio.Semaphore(VK_PUBLISH_CONCURRENCY)
+        _vk_publish_semaphores[telegram_id] = sem
+    return sem
 
 # Ретрай публикации при временных ошибках VK / сети.
 VK_PUBLISH_RETRIES = int(os.getenv("VK_PUBLISH_RETRIES", "3"))       # всего попыток
@@ -81,10 +96,18 @@ VK_RETRYABLE_ERROR_CODES = {1, 6, 9, 10}  # неизвестная/too many/floo
 # (для реков — «живее», когда время чуть «плавает»).
 PUBLISH_JITTER_SECONDS = int(os.getenv("PUBLISH_JITTER_SECONDS", "300"))
 
-# Активные задачи загрузки по message_id статусного сообщения
-# (Task не сериализуется, поэтому не в user_data; ключ по message_id —
-#  чтобы поддержать несколько параллельных загрузок и точечную отмену каждой).
-_upload_tasks: dict[int, asyncio.Task] = {}
+# При старте бот восстанавливает отложенные публикации из БД. Просроченные
+# (их время прошло, пока бот лежал) публикуются сразу, но с этим интервалом
+# между собой — чтобы накопившиеся ролики не ушли в VK залпом и не словили
+# rate-limit.
+RESTORE_SPREAD_SECONDS = int(os.getenv("RESTORE_SPREAD_SECONDS", "20"))
+
+# Активные задачи загрузки. Ключ — (chat_id, message_id) статусного сообщения:
+# message_id уникален лишь ВНУТРИ чата, поэтому у разных пользователей id
+# совпадают. Ключ только по message_id приводил бы к коллизии между юзерами —
+# кнопка «Отмена» одного могла отменить чужую загрузку. Пара (chat_id, message_id)
+# глобально уникальна.
+_upload_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
 
 class VKError(RuntimeError):
@@ -345,6 +368,7 @@ def upload_to_vk(
 
 
 async def _publish_to_vk(
+    telegram_id: int,
     vk_token: str,
     vk_group_id: int,
     file_path: str,
@@ -353,15 +377,18 @@ async def _publish_to_vk(
 ) -> None:
     """Публикует видео в VK с ограничением одновременности и ретраями.
 
-    - семафор (1): запросы к VK не идут лавиной, даже если в один слот попало
-      много роликов — они выстраиваются в очередь;
+    - семафор на пользователя: запросы одного юзера к VK не идут лавиной, даже
+      если в один слот попало много его роликов — они выстраиваются в очередь.
+      Разные пользователи друг друга НЕ ждут (лимит VK — по токену);
     - ретрай с экспоненциальным backoff на временные ошибки VK (rate limit /
-      flood / internal) и сетевые сбои.
+      flood / internal) и сетевые сбои. Пауза между попытками — ВНЕ семафора,
+      чтобы ожидание не блокировало публикации других роликов того же юзера.
     """
     loop = asyncio.get_running_loop()
-    async with _vk_publish_semaphore:
-        last_exc: Exception | None = None
-        for attempt in range(1, VK_PUBLISH_RETRIES + 1):
+    semaphore = _user_publish_semaphore(telegram_id)
+    last_exc: Exception | None = None
+    for attempt in range(1, VK_PUBLISH_RETRIES + 1):
+        async with semaphore:
             try:
                 await loop.run_in_executor(
                     None,
@@ -374,12 +401,14 @@ async def _publish_to_vk(
                 if not retryable or attempt == VK_PUBLISH_RETRIES:
                     raise
 
-            delay = VK_RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 2)
-            logger.warning(
-                "Публикация в VK не удалась (попытка %s/%s): %s. Повтор через %.1f c",
-                attempt, VK_PUBLISH_RETRIES, last_exc, delay,
-            )
-            await asyncio.sleep(delay)
+        # Пауза перед повтором — вне семафора: пропуск освобождён, другие ролики
+        # этого юзера могут публиковаться, пока текущий ждёт следующей попытки.
+        delay = VK_RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 2)
+        logger.warning(
+            "Публикация в VK не удалась (попытка %s/%s): %s. Повтор через %.1f c",
+            attempt, VK_PUBLISH_RETRIES, last_exc, delay,
+        )
+        await asyncio.sleep(delay)
 
 
 def _format_error(exc: Exception, stage: str | None, group_name: str | None) -> str:
@@ -445,6 +474,7 @@ async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         await _publish_to_vk(
+            telegram_id,
             data["vk_token"],
             data["vk_group_id"],
             file_path,
@@ -473,11 +503,98 @@ async def _scheduled_upload_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
     finally:
+        # Публикация завершена (успешно или финальной ошибкой) — убираем строку
+        # из расписания, чтобы при следующем перезапуске её не восстановили заново.
+        post_id = data.get("scheduled_post_id")
+        if post_id is not None:
+            db.delete_scheduled_post(post_id)
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
             except OSError:
                 pass
+
+
+async def _restore_scheduled_posts(app: Application) -> None:
+    """Восстанавливает отложенные публикации из БД после перезапуска бота.
+
+    job_queue хранится только в памяти — без этого все запланированные ролики
+    терялись бы при рестарте (а файлы навсегда оседали бы в PENDING_DIR).
+    Вызывается через post_init, до старта polling.
+
+    Просроченные (время наступило, пока бот лежал) публикуем сразу, разнося
+    по RESTORE_SPREAD_SECONDS, чтобы не уйти в VK залпом.
+    """
+    posts = db.get_scheduled_posts()
+    if not posts:
+        return
+
+    now = datetime.now(MOSCOW_TZ)
+    overdue_index = 0
+    restored = 0
+
+    for post in posts:
+        # Файл мог не пережить рестарт (например, /tmp вместо смонтированного
+        # volume). Публиковать нечего — чистим запись и предупреждаем.
+        if not os.path.exists(post["file_path"]):
+            db.delete_scheduled_post(post["id"])
+            try:
+                await app.bot.send_message(
+                    post["chat_id"],
+                    f"⚠️ Отложенное видео в «{post['vk_group_name']}» не удалось "
+                    "восстановить после перезапуска: файл не найден. Загрузи заново.",
+                )
+            except Exception:
+                pass
+            continue
+
+        # Токен могли удалить, пока бот лежал — публиковать нечем.
+        vk_token = db.get_vk_token(post["telegram_id"])
+        if not vk_token:
+            db.delete_scheduled_post(post["id"])
+            try:
+                os.remove(post["file_path"])
+            except OSError:
+                pass
+            try:
+                await app.bot.send_message(
+                    post["chat_id"],
+                    f"⚠️ Отложенное видео в «{post['vk_group_name']}» не опубликовано: "
+                    "VK токен больше не задан.",
+                )
+            except Exception:
+                pass
+            continue
+
+        publish_at = datetime.fromtimestamp(post["publish_at"], tz=MOSCOW_TZ)
+        if publish_at > now:
+            when = publish_at
+        else:
+            when = timedelta(seconds=5 + overdue_index * RESTORE_SPREAD_SECONDS)
+            overdue_index += 1
+
+        app.job_queue.run_once(
+            _scheduled_upload_job,
+            when=when,
+            data={
+                "chat_id": post["chat_id"],
+                "telegram_id": post["telegram_id"],
+                "file_path": post["file_path"],
+                "title": post["title"],
+                "description": post["description"],
+                "vk_token": vk_token,
+                "vk_group_id": post["vk_group_id"],
+                "vk_group_name": post["vk_group_name"],
+                "platform": post["platform"],
+                "url": post["url"],
+                "scheduled_post_id": post["id"],
+            },
+            name=f"restored_{post['id']}",
+        )
+        restored += 1
+
+    if restored:
+        logger.info("Восстановлено отложенных публикаций: %s (просрочено: %s)", restored, overdue_index)
 
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
@@ -575,7 +692,7 @@ async def do_upload(
     job: dict,
     publish_date: int | None = None,
     status_message=None,
-    task_key: int | None = None,
+    task_key: tuple[int, int] | None = None,
 ):
     # job — снимок данных на момент старта. context.user_data НЕ используем:
     # пользователь может начать новый поток, и общий user_data будет перезаписан.
@@ -615,7 +732,12 @@ async def do_upload(
             # ставим задачу на нужное время. В VK ничего не грузим до этого
             # момента — иначе видео сразу появится в разделе «Видео» группы.
             os.makedirs(PENDING_DIR, exist_ok=True)
-            persistent_path = os.path.join(PENDING_DIR, os.path.basename(file_path))
+            # UUID-префикс гарантирует уникальность даже если два пользователя
+            # скачали одно и то же видео одновременно — без него второй shutil.move
+            # перезаписывал бы файл первого, и запланированная публикация падала бы
+            # с «файл не найден».
+            unique_name = f"{uuid.uuid4().hex}_{os.path.basename(file_path)}"
+            persistent_path = os.path.join(PENDING_DIR, unique_name)
             shutil.move(file_path, persistent_path)
             file_path = None  # файл перемещён, finally не должен его удалять
 
@@ -624,6 +746,23 @@ async def do_upload(
             # «живее», и заодно разносит во времени видео из одного слота.
             jitter = random.randint(0, PUBLISH_JITTER_SECONDS)
             dt = datetime.fromtimestamp(publish_date + jitter, tz=MOSCOW_TZ)
+
+            # Пишем расписание в БД, чтобы публикация пережила перезапуск бота
+            # (job_queue живёт только в памяти). Строку удалит _scheduled_upload_job
+            # после публикации.
+            post_id = db.add_scheduled_post(
+                telegram_id=telegram_id,
+                chat_id=chat_id,
+                file_path=persistent_path,
+                title=title,
+                description=description,
+                vk_group_id=vk_group_id,
+                vk_group_name=vk_group_name,
+                platform=platform,
+                url=url,
+                publish_at=int(dt.timestamp()),
+            )
+
             context.job_queue.run_once(
                 _scheduled_upload_job,
                 when=dt,
@@ -638,8 +777,9 @@ async def do_upload(
                     "vk_group_name": vk_group_name,
                     "platform": platform,
                     "url": url,
+                    "scheduled_post_id": post_id,
                 },
-                name=f"scheduled_{task_key}",
+                name=f"scheduled_{post_id}",
             )
 
             await set_status(
@@ -654,7 +794,7 @@ async def do_upload(
             await set_status(
                 f"📤 Публикую в «{vk_group_name}» (id {vk_group_id})…\nРазмер: {size_mb:.1f} МБ"
             )
-            await _publish_to_vk(vk_token, vk_group_id, file_path, title, description)
+            await _publish_to_vk(telegram_id, vk_token, vk_group_id, file_path, title, description)
             await set_status(f"✅ Опубликовано в «{vk_group_name}»!", final=True)
 
     except asyncio.CancelledError:
@@ -709,7 +849,7 @@ def _start_upload(chat_id: int, context: ContextTypes.DEFAULT_TYPE, publish_date
     """Запускает загрузку в фоне и СРАЗУ возвращается — диспетчер бота не блокируется,
     поэтому бот продолжает отвечать на другие сообщения во время скачивания/заливки."""
     job = _snapshot_job(context)
-    task_key = status_msg.message_id
+    task_key = (chat_id, status_msg.message_id)
     task = asyncio.create_task(
         do_upload(
             chat_id, context, job,
@@ -869,7 +1009,10 @@ async def handle_cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer("Отмена...")
     # Кнопка «Отмена» висит на том же сообщении, по которому задача и ключуется.
-    task = _upload_tasks.get(query.message.message_id)
+    # Ключ — (chat_id, message_id): message_id уникален лишь внутри чата, поэтому
+    # без chat_id отмена одного юзера могла бы попасть в чужую загрузку.
+    task_key = (query.message.chat_id, query.message.message_id)
+    task = _upload_tasks.get(task_key)
     if task and not task.done():
         task.cancel()
     else:
@@ -1372,6 +1515,9 @@ def main() -> None:
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .persistence(persistence)
+        # После инициализации, до старта polling, восстанавливаем отложенные
+        # публикации из БД — чтобы рестарт бота не терял запланированные видео.
+        .post_init(_restore_scheduled_posts)
         .concurrent_updates(True)
         .connect_timeout(30.0)
         .read_timeout(30.0)

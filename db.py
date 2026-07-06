@@ -61,6 +61,23 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_error_logs_user
                 ON error_logs (telegram_id, created_at DESC);
+
+            -- Отложенные публикации: строка живёт от планирования до момента
+            -- публикации. Нужна, чтобы расписание пережило перезапуск бота —
+            -- job_queue хранится только в памяти и при рестарте теряется.
+            CREATE TABLE IF NOT EXISTS scheduled_posts (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id   INTEGER NOT NULL,
+                chat_id       INTEGER NOT NULL,
+                file_path     TEXT NOT NULL,
+                title         TEXT NOT NULL,
+                description   TEXT NOT NULL,
+                vk_group_id   INTEGER NOT NULL,
+                vk_group_name TEXT NOT NULL,
+                platform      TEXT,
+                url           TEXT,
+                publish_at    INTEGER NOT NULL   -- unix-время публикации (с джиттером)
+            );
             """
         )
 
@@ -300,3 +317,48 @@ def cleanup_old_errors(days: int) -> int:
     with _connect() as conn:
         cur = conn.execute("DELETE FROM error_logs WHERE created_at < ?", (cutoff,))
         return cur.rowcount
+
+
+# ─── Отложенные публикации ────────────────────────────────────────────────────
+
+def add_scheduled_post(
+    *,
+    telegram_id: int,
+    chat_id: int,
+    file_path: str,
+    title: str,
+    description: str,
+    vk_group_id: int,
+    vk_group_name: str,
+    platform: str | None,
+    url: str | None,
+    publish_at: int,
+) -> int:
+    """Сохраняет отложенную публикацию. Возвращает id строки (для последующего
+    удаления после публикации). VK-токен намеренно НЕ храним — при восстановлении
+    берём свежий из users, чтобы не держать копию токена в двух местах."""
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO scheduled_posts
+                (telegram_id, chat_id, file_path, title, description,
+                 vk_group_id, vk_group_name, platform, url, publish_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (telegram_id, chat_id, file_path, title, description,
+             vk_group_id, vk_group_name, platform, url, publish_at),
+        )
+        return cur.lastrowid
+
+
+def get_scheduled_posts() -> list[sqlite3.Row]:
+    """Все незавершённые отложенные публикации (для восстановления при старте)."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM scheduled_posts ORDER BY publish_at"
+        ).fetchall()
+
+
+def delete_scheduled_post(post_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM scheduled_posts WHERE id = ?", (post_id,))

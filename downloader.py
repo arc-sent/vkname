@@ -102,15 +102,28 @@ def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
+        # Отдельный кэш-каталог на каждый вызов — несколько параллельных
+        # загрузок не будут конкурировать за один и тот же кэш-файл.
+        "cachedir": os.path.join(tmpdir, ".cache"),
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
+        expected = ydl.prepare_filename(info)
 
     title = (info.get("title") or "TikTok Video")[:100]
-    files = [f for f in os.listdir(tmpdir) if os.path.isfile(os.path.join(tmpdir, f))]
-    if not files:
-        raise RuntimeError("Файл TikTok не был скачан")
-    return _ensure_h264(os.path.join(tmpdir, files[0])), title
+    # Берём именно тот файл, который yt-dlp считает итоговым, а не первый
+    # попавшийся — это исключает выбор промежуточных .part-файлов.
+    candidate = expected if os.path.isfile(expected) else None
+    if candidate is None:
+        mp4s = sorted(
+            (f for f in os.listdir(tmpdir) if f.endswith(".mp4") and os.path.isfile(os.path.join(tmpdir, f))),
+            key=lambda f: os.path.getsize(os.path.join(tmpdir, f)),
+            reverse=True,
+        )
+        if not mp4s:
+            raise RuntimeError("Файл TikTok не был скачан")
+        candidate = os.path.join(tmpdir, mp4s[0])
+    return _ensure_h264(candidate), title
 
 
 async def download_tiktok(url: str, save_path: str | None = None) -> tuple[str, str]:
@@ -442,15 +455,24 @@ def _download_vk_ytdlp_sync(url: str) -> tuple[str, str]:
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
+        "cachedir": os.path.join(tmpdir, ".cache"),
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
+        expected = ydl.prepare_filename(info)
 
     title = (info.get("title") or "VK видео")[:100]
-    files = [f for f in os.listdir(tmpdir) if os.path.isfile(os.path.join(tmpdir, f))]
-    if not files:
-        raise RuntimeError("Файл VK (yt-dlp) не был скачан")
-    return _ensure_h264(os.path.join(tmpdir, files[0])), title
+    candidate = expected if os.path.isfile(expected) else None
+    if candidate is None:
+        mp4s = sorted(
+            (f for f in os.listdir(tmpdir) if f.endswith(".mp4") and os.path.isfile(os.path.join(tmpdir, f))),
+            key=lambda f: os.path.getsize(os.path.join(tmpdir, f)),
+            reverse=True,
+        )
+        if not mp4s:
+            raise RuntimeError("Файл VK (yt-dlp) не был скачан")
+        candidate = os.path.join(tmpdir, mp4s[0])
+    return _ensure_h264(candidate), title
 
 
 def _download_vk_sync(url: str, vk_token: str | None) -> tuple[str, str]:
