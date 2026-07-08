@@ -20,7 +20,7 @@ from telegram.ext import (
 from dotenv import load_dotenv
 
 import db
-from downloader import detect_platform, download_tiktok, download_likee, download_vk
+from downloader import detect_platform, download_tiktok, download_likee, download_youtube, download_vk
 
 load_dotenv()
 
@@ -43,6 +43,7 @@ ERRORS_PAGE_SIZE = 8
 PLATFORM_LABELS = {
     "tiktok": "TikTok",
     "likee": "Likee",
+    "youtube": "YouTube Shorts",
     "vk": "VK",
 }
 
@@ -720,6 +721,8 @@ async def do_upload(
             file_path, title = await download_tiktok(url, None)
         elif platform == "likee":
             file_path, title = await download_likee(url)
+        elif platform == "youtube":
+            file_path, title = await download_youtube(url, None)
         elif platform == "vk":
             file_path, title = await download_vk(url, vk_token)
         else:
@@ -866,12 +869,12 @@ def _start_upload(chat_id: int, context: ContextTypes.DEFAULT_TYPE, publish_date
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.ensure_user(update.effective_user.id)
     await update.message.reply_text(
-        "Привет! Я скачиваю видео из TikTok, Likee и VK и публикую в твою группу VK.\n\n"
+        "Привет! Я скачиваю видео из TikTok, Likee, YouTube Shorts и VK и публикую в твою группу VK.\n\n"
         "Кнопки внизу:\n"
         f"{BTN_TOKEN} — посмотреть / изменить / удалить VK токен\n"
         f"{BTN_GROUPS} — управление группами VK\n"
         f"{BTN_TEMPLATES} — заготовки описаний\n\n"
-        "Чтобы опубликовать видео — просто пришли ссылку на TikTok, Likee или VK.",
+        "Чтобы опубликовать видео — просто пришли ссылку на TikTok, Likee, YouTube Shorts или VK.",
         reply_markup=main_keyboard(),
     )
 
@@ -886,6 +889,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             "Не распознал ссылку. Поддерживаются:\n"
             "• TikTok (tiktok.com)\n"
             "• Likee (likee.video)\n"
+            "• YouTube Shorts (youtube.com/shorts…, youtu.be)\n"
             "• VK видео и клипы (vk.com/video…, vk.com/clip…)"
         )
         return ConversationHandler.END

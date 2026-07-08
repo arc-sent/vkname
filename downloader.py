@@ -1,4 +1,4 @@
-"""Скачивание видео с TikTok, Likee и VK."""
+"""Скачивание видео с TikTok, Likee, YouTube Shorts и VK."""
 
 import asyncio
 import logging
@@ -62,42 +62,50 @@ def _tmp_path(prefix: str) -> str:
 
 # ─── Определение платформы ────────────────────────────────────────────────────
 
-_TIKTOK_RE = re.compile(r"tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com", re.IGNORECASE)
-_LIKEE_RE  = re.compile(r"https?://(?:l\.)?likee\.video/", re.IGNORECASE)
-_VK_RE     = re.compile(r"https?://(?:(?:www|m)\.)?vk\.(?:com|ru)/(?:video|clips?)", re.IGNORECASE)
+_TIKTOK_RE  = re.compile(r"tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com", re.IGNORECASE)
+_LIKEE_RE   = re.compile(r"https?://(?:l\.)?likee\.video/", re.IGNORECASE)
+_VK_RE      = re.compile(r"https?://(?:(?:www|m)\.)?vk\.(?:com|ru)/(?:video|clips?)", re.IGNORECASE)
+_YOUTUBE_RE = re.compile(
+    r"https?://(?:(?:www|m)\.)?(?:youtube\.com/(?:shorts/|watch\?|embed/|v/|live/)|youtu\.be/)",
+    re.IGNORECASE,
+)
 
 
 def detect_platform(url: str) -> str | None:
-    """Возвращает 'tiktok', 'likee', 'vk' или None."""
+    """Возвращает 'tiktok', 'likee', 'youtube', 'vk' или None."""
     if _TIKTOK_RE.search(url):
         return "tiktok"
     if _LIKEE_RE.match(url):
         return "likee"
+    if _YOUTUBE_RE.match(url):
+        return "youtube"
     if _VK_RE.match(url):
         return "vk"
     return None
 
 
-# ─── TikTok (yt-dlp) ─────────────────────────────────────────────────────────
+# ─── Универсальный загрузчик через yt-dlp (TikTok, YouTube Shorts) ────────────
 
-def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
+def _download_ytdlp_sync(
+    url: str,
+    save_path: str | None,
+    prefix: str,
+    default_title: str,
+) -> tuple[str, str]:
     # Фаза 1: получаем метаданные без скачивания — проверяем длительность
     with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
         meta = ydl.extract_info(url, download=False)
     _check_duration(meta.get("duration"))
 
     # Фаза 2: скачиваем
-    tmpdir = save_path or _tmp_path("tiktok_dir")
-    if save_path:
-        os.makedirs(save_path, exist_ok=True)
-    else:
-        os.makedirs(tmpdir, exist_ok=True)
+    tmpdir = save_path or _tmp_path(f"{prefix}_dir")
+    os.makedirs(tmpdir, exist_ok=True)
 
     ydl_opts = {
         "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        # Приоритет H.264: VK кладёт в «Клипы» только H.264, а TikTok отдаёт
-        # высокое разрешение в HEVC. Берём лучший доступный H.264-вариант.
+        # Приоритет H.264: VK кладёт в «Клипы» только H.264, а источники отдают
+        # высокое разрешение в HEVC/VP9. Берём лучший доступный H.264-вариант.
         "format_sort": ["vcodec:h264"],
         "merge_output_format": "mp4",
         "quiet": True,
@@ -110,7 +118,7 @@ def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
         info = ydl.extract_info(url, download=True)
         expected = ydl.prepare_filename(info)
 
-    title = (info.get("title") or "TikTok Video")[:100]
+    title = (info.get("title") or default_title)[:100]
     # Берём именно тот файл, который yt-dlp считает итоговым, а не первый
     # попавшийся — это исключает выбор промежуточных .part-файлов.
     candidate = expected if os.path.isfile(expected) else None
@@ -121,7 +129,7 @@ def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
             reverse=True,
         )
         if not mp4s:
-            raise RuntimeError("Файл TikTok не был скачан")
+            raise RuntimeError(f"Файл ({prefix}) не был скачан")
         candidate = os.path.join(tmpdir, mp4s[0])
     return _ensure_h264(candidate), title
 
@@ -129,7 +137,19 @@ def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
 async def download_tiktok(url: str, save_path: str | None = None) -> tuple[str, str]:
     """Возвращает (путь к файлу, название)."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _download_tiktok_sync, url, save_path)
+    return await loop.run_in_executor(
+        None, _download_ytdlp_sync, url, save_path, "tiktok", "TikTok Video"
+    )
+
+
+async def download_youtube(url: str, save_path: str | None = None) -> tuple[str, str]:
+    """Скачивает YouTube Shorts (и обычные видео) через yt-dlp.
+
+    Возвращает (путь к файлу, название)."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, _download_ytdlp_sync, url, save_path, "youtube", "YouTube Video"
+    )
 
 
 # ─── Likee ────────────────────────────────────────────────────────────────────
